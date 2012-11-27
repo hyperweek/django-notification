@@ -1,12 +1,16 @@
+import logging
 from django.db import models
 from django.contrib.sites.models import Site
+from django import template
 from django.template import Context
 from django.template.loader import render_to_string
-from django.core.urlresolvers import reverse, set_script_prefix
+from django.core.urlresolvers import reverse, set_script_prefix, get_script_prefix
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.translation import get_language, activate
 
 from notification.conf import settings
+
+logger = logging.getLogger('notification')
 
 
 ### QUEUE ##############################################################
@@ -62,6 +66,35 @@ class context_language(object):
         activate(self.current_language)
 
 
+class AbsoluteUrlContext():
+    def __init__(self):
+        self.prev_media_url = settings.MEDIA_URL
+        self.prev_static_url = settings.STATIC_URL
+        self.prev_script_prefix = get_script_prefix()
+
+    def __enter__(self):
+        protocol = getattr(settings, 'DEFAULT_HTTP_PROTOCOL', 'http')
+        current_site = Site.objects.get_current()
+        site_url = u"%s://%s" % (protocol, unicode(current_site.domain))
+        # prefix MEDIA_URL and STATIC_URL with absolute site url
+        # e.g MEDIA_URL may be used trough solr-thumnail {% thumbnail image as thumb %} {{thumb.url}}
+        if not self.prev_media_url.startswith('http'):
+            settings.MEDIA_URL = u'%s%s' % (site_url, settings.MEDIA_URL)
+
+        # e.g STATIC_URL trough {% static "relative-url"}
+        if not self.prev_static_url.startswith('http'):
+            settings.STATIC_URL = u'%s%s' % (site_url, settings.STATIC_URL)
+
+        # prefix reversed url https://github.com/django/django/blob/master/django/core/urlresolvers.py#L450
+        if not self.prev_script_prefix.startswith('http'):
+            set_script_prefix(site_url)
+
+    def __exit__(self, type, value, traceback):
+        settings.MEDIA_URL = self.prev_media_url
+        settings.STATIC_URL = self.prev_static_url
+        set_script_prefix(self.prev_script_prefix)
+
+
 class LanguageStoreNotAvailable(Exception):
     pass
 
@@ -95,24 +128,12 @@ class NotificationContext(Context):
         current_site = Site.objects.get_current()
         site_url = u"%s://%s" % (protocol, unicode(current_site.domain))
 
-        # prefix MEDIA_URL and STATIC_URL with absolute site url
-        # e.g MEDIA_URL may be used trough solr-thumnail {% thumbnail image as thumb %} {{thumb.url}}
-        if not settings.MEDIA_URL.startswith('http'):
-            settings.MEDIA_URL = u'%s%s' % (site_url, settings.MEDIA_URL)
-
-        # e.g STATIC_URL trough {% static "relative-url"}
-        if not settings.STATIC_URL.startswith('http'):
-            settings.STATIC_URL = u'%s%s' % (site_url, settings.STATIC_URL)
-
-        # prefix reversed url https://github.com/django/django/blob/master/django/core/urlresolvers.py#L450
-        set_script_prefix(site_url)
-
         self.update({
             'current_site': current_site,  # backward-compatibility
             'site': current_site,
             'site_url': site_url,
-            'notices_url': reverse('notification_notices'),
-            'notices_settings_url': reverse('notification_notice_settings'),
+            'notices_url': u"%s%s" % (site_url, reverse('notification_notices')),
+            'notices_settings_url': u"%s%s" % (site_url, reverse('notification_notice_settings')),
         })
 
 
@@ -121,15 +142,21 @@ def get_formatted_messages(formats, label, context):
     Returns a dictionary with the format identifier as the key. The values are
     are fully rendered templates with the given context.
     """
+
     format_templates = {}
-    for format in formats:
-        # conditionally turn off autoescaping for .txt extensions in format
-        if format.endswith(".txt"):
-            context.autoescape = False
-        else:
-            context.autoescape = True
-        format_templates[format] = render_to_string((
-                "notification/%s/%s" % (label, format),
-                "notification/%s" % format),
-            context_instance=context)
+    with AbsoluteUrlContext():
+        for format in formats:
+            # conditionally turn off autoescaping for .txt extensions in format
+            if format.endswith(".txt"):
+                context.autoescape = False
+            else:
+                context.autoescape = True
+            try:
+                format_templates[format] = render_to_string((
+                        "notification/%s/%s" % (label, format),
+                        "notification/%s" % format),
+                    context_instance=context)
+            except template.TemplateDoesNotExist, e:
+                logger.error(e, exc_info=True)
+
     return format_templates
